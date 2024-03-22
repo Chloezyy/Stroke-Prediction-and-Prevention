@@ -1,0 +1,1361 @@
+---
+title: "Final Project"
+author: "Chloe Zhang"
+date: "`r Sys.Date()`"
+output:
+  html_document: default
+  pdf_document: 
+    latex_engine: xelatex
+  word_document: default
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      dpi = 400,
+                      warning = FALSE,
+                      message = FALSE,
+                      fig.align = 'center',
+                      comment = "#>",
+                      tidy = F)
+```
+
+
+## Preliminary Part
+
+Before using *R* to analyze the data, it is necessary to load the relevant expansion package in advance, and carry out exploratory data analysis on the data, so as to have a certain understanding of the data and prevent the related problems from affecting the establishment and operation of the model.
+
+```{r}
+library(tidyverse)
+library(caret)
+library(adabag)
+library(corrplot)
+library(knitr)
+library(kableExtra)
+library(DataExplorer)
+library(pROC)
+library(yardstick)
+library(gridExtra)
+library(ROSE)
+library(flextable)
+library(ggsci)
+library(xgboost)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(ROCR)
+library(dbarts)
+
+
+```
+
+In the part of exploratory data analysis, firstly, the variables *bmi* with missing values are removed, and then the types of some variables are converted to corresponding types. Among them, some character type variables need to be converted to numerical type, and some character type variables need to be converted to factor type, and then the *ID* column without practical significance is removed. In order to conform to the generality of the model, I choose to change the character type variables into numerical type The dependent variables are converted to *Yes* and *No* instead of the original *0* and *1*.
+
+```{r}
+stroke_data <- read_csv("healthcare-dataset-stroke-data.csv") %>% 
+  dplyr::filter(bmi != "N/A") %>% 
+  mutate(across(.cols = c(bmi),as.numeric)) %>% 
+  mutate(across(.cols = c(gender,hypertension,heart_disease,work_type,Residence_type,ever_married,smoking_status,stroke),as.factor)) %>% 
+  dplyr::select(-id) %>% 
+  mutate(across(stroke,factor))
+```
+
+Then the missing values are counted, and it is found that there is no missing value in the data set after preprocessing.
+
+```{r}
+stroke_data %>% 
+  plot_missing()
+```
+
+Next, the correlation coefficient matrix is calculated for all continuous numerical variables in the data, and then visualized.
+
+```{r}
+num_vars <- stroke_data %>% 
+  keep(is.numeric) %>% 
+  names()
+
+corr_matrix <- cor(stroke_data[num_vars])
+
+# Plot the correlation matrix using corrplot
+corrplot(corr_matrix, method = "circle", type = "upper", 
+         tl.col = "black", tl.srt = 45, addCoef.col = "black", 
+         tl.cex = 0.8, number.cex = 0.7)
+```
+
+From the correlation coefficient diagram, we can see that the correlation coefficient between numerical variables is low, so all the variables can be considered into the model.
+
+```{r}
+stroke_data %>% 
+  dplyr::select_if(is.factor) %>% 
+  bind_cols(stroke_data %>% 
+              dplyr::select_if(is.character)) %>% 
+  pivot_longer(everything(),
+               names_to = "vars",
+               values_to = "value") %>% 
+  ggplot(aes(value,fill = vars))+
+  geom_bar(aes(value,fill = vars),alpha = 0.7,stat = "count") +
+  stat_count(geom = "text", colour = "black", size = 3.5,
+             aes(label = ..count..),position=position_stack(vjust=0.5)) +
+  facet_wrap(~ vars,scales = "free") +
+  scale_y_continuous(name = "freq") + 
+  scale_x_discrete(name = "Factor variables") +
+  labs(title = "Barplot of different variables") +
+  guides(fill = FALSE)+
+  ggsci::scale_fill_lancet()+
+  theme_bw()+
+  theme(plot.title = element_text(size = 14,hjust = 0.5, face = "bold"),
+        text = element_text(size = 12,face = "bold",hjust = 0.5),
+        axis.title.y = element_text(face = "bold",hjust = 0.5),
+        axis.text.x = element_text(size = 6,face = "bold",hjust = 0.5, vjust = 0.5))
+```
+
+The bar chart of factor type variable shows that the distribution of classification variable is quite different.
+
+## Split dataset
+
+In order to ensure the repeatability of the experimental results, random number seeds are set here. The specific data is divided according to the stratified sampling method, and the proportion of training set and test set is as follows.
+
+```{r step2}
+set.seed(1)
+train.index <- createDataPartition(stroke_data$stroke, p = .7,list = FALSE)
+train <- stroke_data[ train.index,]
+test  <- stroke_data[-train.index,]
+
+whole_prop <- stroke_data %>% 
+  group_by(stroke) %>% 
+  summarise(count = n()) %>% 
+  mutate(prop = count/sum(count)) %>% 
+  mutate(dataset = "whole_dataset") %>% 
+  dplyr::select(dataset,everything())
+
+train_prop <- train %>% 
+  group_by(stroke) %>% 
+  summarise(count = n()) %>% 
+  mutate(prop = count/sum(count)) %>% 
+  mutate(dataset = "train_dataset") %>% 
+  dplyr::select(dataset,everything())
+
+test_prop <- test %>% 
+  group_by(stroke) %>% 
+  summarise(count = n()) %>% 
+  mutate(prop = count/sum(count)) %>% 
+  mutate(dataset = "test_dataset") %>% 
+  dplyr::select(dataset,everything())
+
+whole_prop %>% 
+  bind_rows(train_prop) %>% 
+  bind_rows(test_prop) %>% 
+  mutate(across(prop,.fns = function(x) return(round(x,2)))) %>% 
+  regulartable()
+```
+
+By calculating the stratified sampling percentage, we can find that there is a serious imbalance in the sample. Therefore, it is necessary to resample the data.
+
+```{r}
+stroke_train_rose <- ROSE(stroke ~ ., data = train, seed = 1)$data
+stroke_train_rose %>% 
+  group_by(stroke) %>% 
+  summarise(count = n()) %>% 
+  regulartable()
+
+```
+
+After resampling, the proportion of positive and negative samples is reasonable.
+
+## Building Models
+
+Boosting
+```{r}
+
+library(xgboost)
+#creating a list to store values for boosting and bag models 
+phat_list = list() 
+
+X_train = makeModelMatrixFromDataFrame(stroke_train_rose[,-11])
+y_train = as.numeric(as.character(stroke_train_rose$stroke))
+X_val = makeModelMatrixFromDataFrame(test[,-11])
+y_val = as.numeric(as.character(test$stroke))
+
+
+#fit boosted trees
+grid_boost = expand.grid(
+  shrinkage = c(0.1, 0.01, 0.001), 
+  interaction.depth = c(1, 2, 4),
+  nrounds = c(1000, 2000, 5000)
+)
+
+phat_list$boost = matrix(0, nrow(test), nrow(grid_boost)) 
+
+for (i in 1:nrow(grid_boost)){
+  params = list(
+    eta = grid_boost$shrinkage[i], 
+    max_depth = grid_boost$interaction.depth[i]
+  )
+  
+  set.seed(4776)
+  
+  boost_fit = xgboost(
+    data = X_train,
+    label = y_train,
+    params = params,
+    nrounds = grid_boost$nrounds[i],
+    objective = 'binary:logistic',
+    verbose = 0,
+    verbosity = 0
+  )
+
+    phat_list$boost[,i] = predict(boost_fit, newdata=X_val)
+}
+
+
+#boosted tree with best parameters
+losses_boost = c()
+for (i in 1:nrow(grid_boost)){
+  losses_boost[i] = get_deviance(y_val, phat_list$boost[,i])
+}
+
+best_param_boost = grid_boost[which.min(losses_boost),]
+
+best_param = list(
+  eta = best_param_boost$shrinkage, 
+  max_depth = best_param_boost$interaction.depth
+)
+
+set.seed(4776)
+
+boost_fit_best = xgboost(
+  data = X_train,
+  label = y_train,
+  params = best_param,
+  nrounds = best_param_boost$nrounds,
+  objective = 'binary:logistic',
+  verbose = 0,
+  verbosity = 0
+)
+
+best_phat_boost = predict(boost_fit_best, newdata=X_val)
+
+#confusion matrix and accuracy
+boost_res = get_confusion_matrix(y_val, best_phat_boost)
+boost_res$table
+
+paste('Accuracy:', round(boost_res$overall[1],3))
+
+#AUC
+
+# Compute AUC
+auc_boost <- roc(y_val, best_phat_boost)$auc
+
+# Print AUC
+paste('AUC:', round(auc_boost, 3))
+
+#Variable importance
+
+# create importance matrix
+importance_matrix <- xgb.importance(model = boost_fit_best)
+# variable importance plot
+xgb.plot.importance(importance_matrix, top_n = 10, measure = "Gain")
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      dpi = 400,
+                      warning = FALSE,
+                      message = FALSE,
+                      fig.align = 'center',
+                      comment = "#>",
+                      tidy = F)
+```
+
+
+## Preliminary Part
+
+Before using *R* to analyze the data, it is necessary to load the relevant expansion package in advance, and carry out exploratory data analysis on the data, so as to have a certain understanding of the data and prevent the related problems from affecting the establishment and operation of the model.
+
+```{r}
+library(tidyverse)
+library(caret)
+library(adabag)
+library(corrplot)
+library(knitr)
+library(kableExtra)
+library(DataExplorer)
+library(pROC)
+library(yardstick)
+library(gridExtra)
+library(ROSE)
+library(flextable)
+```
+
+In the part of exploratory data analysis, firstly, the variables *bmi* with missing values are removed, and then the types of some variables are converted to corresponding types. Among them, some character type variables need to be converted to numerical type, and some character type variables need to be converted to factor type, and then the *ID* column without practical significance is removed. In order to conform to the generality of the model, I choose to change the character type variables into numerical type The dependent variables are converted to *Yes* and *No* instead of the original *0* and *1*.
+
+```{r}
+stroke_data <- read_csv("healthcare-dataset-stroke-data.csv") %>% 
+  dplyr::filter(bmi != "N/A") %>% 
+  mutate(across(.cols = c(bmi),as.numeric)) %>% 
+  mutate(across(.cols = c(gender,hypertension,heart_disease,work_type,Residence_type,ever_married,smoking_status,stroke),as.factor)) %>% 
+  dplyr::select(-id) %>% 
+  mutate(stroke = case_when(
+    stroke == 0 ~ "No",
+    TRUE ~ "Yes"
+  )) %>% 
+  mutate(across(stroke,factor))
+```
+
+Then the missing values are counted, and it is found that there is no missing value in the data set after preprocessing.
+
+```{r}
+stroke_data %>% 
+  plot_missing()
+```
+
+Next, the correlation coefficient matrix is calculated for all continuous numerical variables in the data, and then visualized.
+
+```{r}
+num_vars <- stroke_data %>% 
+  keep(is.numeric) %>% 
+  names()
+
+corr_matrix <- cor(stroke_data[num_vars])
+
+# Plot the correlation matrix using corrplot
+corrplot(corr_matrix, method = "circle", type = "upper", 
+         tl.col = "black", tl.srt = 45, addCoef.col = "black", 
+         tl.cex = 0.8, number.cex = 0.7)
+```
+
+From the correlation coefficient diagram, we can see that the correlation coefficient between numerical variables is low, so all the variables can be considered into the model.
+
+```{r}
+stroke_data %>% 
+  dplyr::select_if(is.factor) %>% 
+  bind_cols(stroke_data %>% 
+              dplyr::select_if(is.character)) %>% 
+  pivot_longer(everything(),
+               names_to = "vars",
+               values_to = "value") %>% 
+  ggplot(aes(value,fill = vars))+
+  geom_bar(aes(value,fill = vars),alpha = 0.7,stat = "count") +
+  stat_count(geom = "text", colour = "black", size = 3.5,
+             aes(label = ..count..),position=position_stack(vjust=0.5)) +
+  facet_wrap(~ vars,scales = "free") +
+  scale_y_continuous(name = "freq") + 
+  scale_x_discrete(name = "Factor variables") +
+  labs(title = "Barplot of different variables") +
+  guides(fill = FALSE)+
+  ggsci::scale_fill_lancet()+
+  theme_bw()+
+  theme(plot.title = element_text(size = 14,hjust = 0.5, face = "bold"),
+        text = element_text(size = 12,face = "bold",hjust = 0.5),
+        axis.title.y = element_text(face = "bold",hjust = 0.5),
+        axis.text.x = element_text(size = 6,face = "bold",hjust = 0.5, vjust = 0.5))
+```
+
+The bar chart of factor type variable shows that the distribution of classification variable is quite different.
+
+
+
+## Split dataset
+
+In order to ensure the repeatability of the experimental results, random number seeds are set here. The specific data is divided according to the stratified sampling method, and the proportion of training set and test set is as follows.
+
+```{r step2}
+set.seed(1)
+train.index <- createDataPartition(stroke_data$stroke, p = .7,list = FALSE)
+train <- stroke_data[ train.index,]
+test  <- stroke_data[-train.index,]
+
+whole_prop <- stroke_data %>% 
+  group_by(stroke) %>% 
+  summarise(count = n()) %>% 
+  mutate(prop = count/sum(count)) %>% 
+  mutate(dataset = "whole_dataset") %>% 
+  dplyr::select(dataset,everything())
+
+train_prop <- train %>% 
+  group_by(stroke) %>% 
+  summarise(count = n()) %>% 
+  mutate(prop = count/sum(count)) %>% 
+  mutate(dataset = "train_dataset") %>% 
+  dplyr::select(dataset,everything())
+
+test_prop <- test %>% 
+  group_by(stroke) %>% 
+  summarise(count = n()) %>% 
+  mutate(prop = count/sum(count)) %>% 
+  mutate(dataset = "test_dataset") %>% 
+  dplyr::select(dataset,everything())
+
+whole_prop %>% 
+  bind_rows(train_prop) %>% 
+  bind_rows(test_prop) %>% 
+  mutate(across(prop,.fns = function(x) return(round(x,2)))) %>% 
+  regulartable()
+```
+
+By calculating the stratified sampling percentage, we can find that there is a serious imbalance in the sample. Therefore, it is necessary to resample the data.
+
+```{r}
+stroke_train_rose <- ROSE(stroke ~ ., data = train, seed = 1)$data
+stroke_train_rose %>% 
+  group_by(stroke) %>% 
+  summarise(count = n()) %>% 
+  regulartable()
+```
+
+After resampling, the proportion of positive and negative samples is reasonable.
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      dpi = 400,
+                      warning = FALSE,
+                      message = FALSE,
+                      fig.align = 'center',
+                      comment = "#>",
+                      tidy = F)
+```
+
+
+## Preliminary Part
+
+Before using *R* to analyze the data, it is necessary to load the relevant expansion package in advance, and carry out exploratory data analysis on the data, so as to have a certain understanding of the data and prevent the related problems from affecting the establishment and operation of the model.
+
+```{r}
+library(tidyverse)
+library(caret)
+library(adabag)
+library(corrplot)
+library(knitr)
+library(kableExtra)
+library(DataExplorer)
+library(pROC)
+library(yardstick)
+library(gridExtra)
+library(ROSE)
+library(flextable)
+```
+
+In the part of exploratory data analysis, firstly, the variables *bmi* with missing values are removed, and then the types of some variables are converted to corresponding types. Among them, some character type variables need to be converted to numerical type, and some character type variables need to be converted to factor type, and then the *ID* column without practical significance is removed. In order to conform to the generality of the model, I choose to change the character type variables into numerical type The dependent variables are converted to *Yes* and *No* instead of the original *0* and *1*.
+
+```{r}
+stroke_data <- read_csv("healthcare-dataset-stroke-data.csv") %>% 
+  dplyr::filter(bmi != "N/A") %>% 
+  mutate(across(.cols = c(bmi),as.numeric)) %>% 
+  mutate(across(.cols = c(gender,hypertension,heart_disease,work_type,Residence_type,ever_married,smoking_status,stroke),as.factor)) %>% 
+  dplyr::select(-id) %>% 
+  mutate(stroke = case_when(
+    stroke == 0 ~ "No",
+    TRUE ~ "Yes"
+  )) %>% 
+  mutate(across(stroke,factor))
+```
+
+Then the missing values are counted, and it is found that there is no missing value in the data set after preprocessing.
+
+```{r}
+stroke_data %>% 
+  plot_missing()
+```
+
+Next, the correlation coefficient matrix is calculated for all continuous numerical variables in the data, and then visualized.
+
+```{r}
+num_vars <- stroke_data %>% 
+  keep(is.numeric) %>% 
+  names()
+
+corr_matrix <- cor(stroke_data[num_vars])
+
+# Plot the correlation matrix using corrplot
+corrplot(corr_matrix, method = "circle", type = "upper", 
+         tl.col = "black", tl.srt = 45, addCoef.col = "black", 
+         tl.cex = 0.8, number.cex = 0.7)
+```
+
+From the correlation coefficient diagram, we can see that the correlation coefficient between numerical variables is low, so all the variables can be considered into the model.
+
+```{r}
+stroke_data %>% 
+  dplyr::select_if(is.factor) %>% 
+  bind_cols(stroke_data %>% 
+              dplyr::select_if(is.character)) %>% 
+  pivot_longer(everything(),
+               names_to = "vars",
+               values_to = "value") %>% 
+  ggplot(aes(value,fill = vars))+
+  geom_bar(aes(value,fill = vars),alpha = 0.7,stat = "count") +
+  stat_count(geom = "text", colour = "black", size = 3.5,
+             aes(label = ..count..),position=position_stack(vjust=0.5)) +
+  facet_wrap(~ vars,scales = "free") +
+  scale_y_continuous(name = "freq") + 
+  scale_x_discrete(name = "Factor variables") +
+  labs(title = "Barplot of different variables") +
+  guides(fill = FALSE)+
+  ggsci::scale_fill_lancet()+
+  theme_bw()+
+  theme(plot.title = element_text(size = 14,hjust = 0.5, face = "bold"),
+        text = element_text(size = 12,face = "bold",hjust = 0.5),
+        axis.title.y = element_text(face = "bold",hjust = 0.5),
+        axis.text.x = element_text(size = 6,face = "bold",hjust = 0.5, vjust = 0.5))
+```
+
+The bar chart of factor type variable shows that the distribution of classification variable is quite different.
+
+
+
+## Split dataset
+
+In order to ensure the repeatability of the experimental results, random number seeds are set here. The specific data is divided according to the stratified sampling method, and the proportion of training set and test set is as follows.
+
+```{r step2}
+set.seed(1)
+train.index <- createDataPartition(stroke_data$stroke, p = .7,list = FALSE)
+train <- stroke_data[ train.index,]
+test  <- stroke_data[-train.index,]
+
+whole_prop <- stroke_data %>% 
+  group_by(stroke) %>% 
+  summarise(count = n()) %>% 
+  mutate(prop = count/sum(count)) %>% 
+  mutate(dataset = "whole_dataset") %>% 
+  dplyr::select(dataset,everything())
+
+train_prop <- train %>% 
+  group_by(stroke) %>% 
+  summarise(count = n()) %>% 
+  mutate(prop = count/sum(count)) %>% 
+  mutate(dataset = "train_dataset") %>% 
+  dplyr::select(dataset,everything())
+
+test_prop <- test %>% 
+  group_by(stroke) %>% 
+  summarise(count = n()) %>% 
+  mutate(prop = count/sum(count)) %>% 
+  mutate(dataset = "test_dataset") %>% 
+  dplyr::select(dataset,everything())
+
+whole_prop %>% 
+  bind_rows(train_prop) %>% 
+  bind_rows(test_prop) %>% 
+  mutate(across(prop,.fns = function(x) return(round(x,2)))) %>% 
+  regulartable()
+```
+
+By calculating the stratified sampling percentage, we can find that there is a serious imbalance in the sample. Therefore, it is necessary to resample the data.
+
+```{r}
+stroke_train_rose <- ROSE(stroke ~ ., data = train, seed = 1)$data
+stroke_train_rose %>% 
+  group_by(stroke) %>% 
+  summarise(count = n()) %>% 
+  regulartable()
+```
+
+After resampling, the proportion of positive and negative samples is reasonable.
+
+
+### SVM
+
+First,we set up repeated k-fold cross validation and fit the model.
+
+```{r}
+train_control <- trainControl(method="repeatedcv",number=10,
+                              repeats=3,savePredictions = TRUE,
+                              classProbs = TRUE)
+svm_model <- train(stroke ~.,data = stroke_train_rose, method = "svmRadial", trControl = train_control, preProcess = c("center","scale"), tuneLength = 10)
+svm_model
+```
+
+
+Here,I print the best tuning parameter sigma and C that maximizes the model accuracy.
+
+* the best tuning parameters
+
+```{r}
+svm_model$bestTune %>% 
+  regulartable()
+```
+
+The choice of C = 64 provides an Accuracy of 0.8747899 which is better than other parameters.
+
+*  the smallest cross-validated misclassification error on the
+training data
+
+```{r}
+svm_model$pred %>% 
+  as_tibble() %>% 
+  dplyr::select(pred,obs,No,Yes,Resample) %>% 
+  nest(-Resample) %>% 
+  mutate(acc = map(data,~accuracy_vec(.x$obs,.x$pred))) %>% 
+  unnest(acc) %>% 
+  dplyr::select(-data) %>% 
+  dplyr::slice_max(acc) %>% 
+  mutate(smallest_cross_validated_misclassification_error = 1-acc) %>% 
+  regulartable()
+```
+
+
+*  the best cross-validated AUC score on the training data
+
+```{r}
+svm_model$pred %>% 
+  as_tibble() %>% 
+  dplyr::select(pred,obs,No,Yes,Resample) %>% 
+  group_by(Resample) %>% 
+  summarise(roc_calc = list(pROC::roc(obs,No))) %>% 
+  mutate(auc = map(roc_calc,.f = function(x) return(as.numeric(auc(x))))) %>% 
+  unnest(auc) %>% 
+  dplyr::select(-roc_calc) %>% 
+  dplyr::slice_max(auc) %>% 
+  mutate(best_cross_validated_AUC_score = auc) %>% 
+  regulartable()
+```
+
+
+* the confusion matrix
+
+The average confusion matrix obtained from the prediction results of 10 fold cross validation is shown below.
+
+```{r}
+confusionMatrix.train(svm_model)
+```
+
+When the model uses the best parameters to predict the training set, and calculates the confusion matrix based on this, the accuracy is significantly improved.
+
+```{r}
+confusionMatrix(data = predict(svm_model,stroke_train_rose),reference = stroke_train_rose$stroke)
+```
+
+* the most important four predictors 
+
+```{r}
+caret::varImp(svm_model) %>% 
+  .$importance %>% 
+  rownames_to_column("variables") %>% 
+  dplyr::select(1:2) %>% 
+  setNames(c("variables","importance")) %>% 
+  arrange(desc(importance)) %>% 
+  head(4) %>% 
+  regulartable()
+
+caret::varImp(svm_model) %>% 
+  .$importance %>% 
+  rownames_to_column("variables") %>% 
+  dplyr::select(1:2) %>% 
+  setNames(c("variables","importance")) %>% 
+  arrange(desc(importance)) %>% 
+  rowid_to_column("rowid") %>% 
+  mutate(group = case_when(
+    rowid > 4 ~ "B",
+    TRUE ~ "A"
+  )) %>% 
+  ggplot(aes(x = reorder(variables,importance),importance,fill = group))+
+  geom_col(alpha = 0.7,bins = 30) +
+  scale_y_continuous(name = "importance") + 
+  labs(title = "variable importance plot") +
+  guides(fill = FALSE)+
+  ggsci::scale_fill_lancet()+
+  theme_bw()+
+  coord_flip() +
+  theme(plot.title = element_text(size = 14,hjust = 0.5, face = "bold"),
+        text = element_text(size = 10,hjust = 0.5),
+        axis.title.y = element_text(face = "bold",hjust = 0.5),
+        axis.text.x = element_text(size = 5,angle = 30,hjust = 0.5, vjust = 0.5))
+```
+
+In support vector machine model, the most important four variables are *age*、*ever_married*、*hypertension* and *avg_glucose_level*.
+
+
+```{r}
+confusionMatrix(data = predict(svm_model,test),reference = test$stroke)
+```
+
+The accuracy of the best model on the test set is 0.8.
+
+```{r}
+
+# Get predicted probabilities of stroke for test set
+pred_prob <- predict(svm_model, newdata = test, type = "prob")[, 1]
+
+# Create ROC curve
+roc_obj <- roc(test$stroke, pred_prob)
+
+# Plot ROC curve
+plot(roc_obj, legacy.axes = TRUE, print.thres = "best",
+     xlab = "1 - Specificity", ylab = "Sensitivity")
+
+```
+
+
+```{r}
+# Predict stroke probabilities for random forest and SVM models
+stroke_xgb_prob <- predict(boost_fit_best, X_val, type = "prob")
+stroke_rf_prob <- predict(rf_model, test, type = "prob")[,1]
+stroke_svm_prob <- predict(svm_model, test, type = "prob")[,1]
+stroke_knn_prob <- predict(knn_model, test, type = "prob")[,1]
+stroke_lr_prob <- predict(lr_model, test, type = "prob")[,1]
+stroke_ann_prob <- predict(ann_model, test, type = "prob")[,1]
+
+
+# Calculate ROC curve and AUC for both models
+xgb_roc <- roc(test$stroke, stroke_xgb_prob)
+rf_roc <- roc(test$stroke, stroke_rf_prob)
+svm_roc <- roc(test$stroke, stroke_svm_prob)
+knn_roc <- roc(test$stroke, stroke_knn_prob)
+lr_roc <- roc(test$stroke, stroke_lr_prob)
+ann_roc <- roc(test$stroke, stroke_ann_prob)
+
+cat("auc of XGB:", roc(y_val, stroke_xgb_prob)$auc, "\n")
+cat("auc of random forest:", roc(test$stroke, stroke_rf_prob)$auc, "\n")
+cat("auc of svm:", roc(test$stroke, stroke_svm_prob)$auc, "\n")
+cat("auc of knn:", roc(test$stroke, stroke_knn_prob)$auc, "\n")
+cat("auc of logistic:", roc(test$stroke, stroke_lr_prob)$auc, "\n")
+cat("auc of ANN:", roc(test$stroke, stroke_ann_prob)$auc, "\n")
+
+# Plot both ROC curves on one plot
+plot(xgb_roc, col = 2, main = "ROC Curves",
+     legacy.axes = TRUE,
+     xlab = "False Positive Rate", ylab = "True Positive Rate")
+lines(svm_roc, col = 4)
+lines(rf_roc, col = 3)
+lines(knn_roc, col = 5)
+lines(lr_roc, col = 8)
+lines(ann_roc, col = 7)
+legend("bottomright", legend = c("xgboost", "SVM", "Random Forest", "KNN", "logistic","Neural Networks"), col = c(2,3,4,5,8,7), lty = 2)
+```
+
+
+### Random Forest
+
+Perform random forest on the training data. 
+
+```{r}
+library(doParallel)
+cores <- makeCluster(detectCores()-1)
+registerDoParallel(cores = cores)
+
+set.seed(123)
+
+#Create control function for training with 10 folds and keep 3 folds for training. search method is grid.
+control <- trainControl(method='repeatedcv', 
+                        number=10, 
+                        repeats=3, 
+                        search='grid',
+                        savePredictions = TRUE,
+                        classProbs = TRUE)
+#create tunegrid with 15 values from 1:15 for mtry to tunning model. Our train function will change number of entry variable at each split according to tunegrid. 
+tunegrid <- expand.grid(.mtry = (1:15)) 
+
+rf_model <- train(stroke ~ .,
+                  data = stroke_train_rose,
+                  method = 'rf',
+                  metric = 'Accuracy',
+                  trControl = control,
+                  tuneGrid = tunegrid)
+rf_model
+```
+
+Here,I print the best tuning parameter mtry that maximizes the model accuracy.
+
+* the best tuning parameters
+
+```{r}
+rf_model$bestTune %>% 
+  regulartable()
+```
+
+The choice of mtry = 4 provides an Accuracy of 0.8446185 which is better than other parameters.
+
+*  the smallest cross-validated misclassification error on the
+training data
+
+```{r}
+rf_model$pred %>% 
+  as_tibble() %>% 
+  dplyr::select(pred,obs,No,Yes,Resample) %>% 
+  nest(-Resample) %>% 
+  mutate(acc = map(data,~accuracy_vec(.x$obs,.x$pred))) %>% 
+  unnest(acc) %>% 
+  dplyr::select(-data) %>% 
+  dplyr::slice_max(acc) %>% 
+  mutate(smallest_cross_validated_misclassification_error = 1-acc) %>% 
+  regulartable()
+```
+
+
+*  the best cross-validated AUC score on the training data
+
+```{r}
+rf_model$pred %>% 
+  as_tibble() %>% 
+  dplyr::select(pred,obs,No,Yes,Resample) %>% 
+  group_by(Resample) %>% 
+  summarise(roc_calc = list(pROC::roc(obs,No))) %>% 
+  mutate(auc = map(roc_calc,.f = function(x) return(as.numeric(auc(x))))) %>% 
+  unnest(auc) %>% 
+  dplyr::select(-roc_calc) %>% 
+  dplyr::slice_max(auc) %>% 
+  mutate(best_cross_validated_AUC_score = auc) %>% 
+  regulartable()
+```
+
+
+* the confusion matrix
+
+The average confusion matrix obtained from the prediction results of 10 fold cross validation is shown below.
+
+```{r}
+confusionMatrix.train(rf_model)
+```
+
+When the model uses the best parameters to predict the training set, and calculates the confusion matrix based on this, the accuracy is significantly improved.
+
+```{r}
+confusionMatrix(data = predict(rf_model,stroke_train_rose),reference = stroke_train_rose$stroke)
+```
+
+
+* the most important four predictors 
+
+```{r}
+caret::varImp(rf_model) %>% 
+  .$importance %>% 
+  rownames_to_column("variables") %>% 
+  dplyr::select(1:2) %>% 
+  setNames(c("variables","importance")) %>% 
+  arrange(desc(importance)) %>% 
+  head(4) %>% 
+  regulartable()
+
+caret::varImp(rf_model) %>% 
+  .$importance %>% 
+  rownames_to_column("variables") %>% 
+  dplyr::select(1:2) %>% 
+  setNames(c("variables","importance")) %>% 
+  arrange(desc(importance)) %>% 
+  rowid_to_column("rowid") %>% 
+  mutate(group = case_when(
+    rowid > 4 ~ "B",
+    TRUE ~ "A"
+  )) %>% 
+  ggplot(aes(x = reorder(variables,importance),importance,fill = group))+
+  geom_col(alpha = 0.7,bins = 30) +
+  scale_y_continuous(name = "importance") + 
+  labs(title = "variable importance plot") +
+  guides(fill = FALSE)+
+  ggsci::scale_fill_lancet()+
+  theme_bw()+
+  coord_flip() +
+  theme(plot.title = element_text(size = 14,hjust = 0.5, face = "bold"),
+        text = element_text(size = 10,hjust = 0.5),
+        axis.title.y = element_text(face = "bold",hjust = 0.5),
+        axis.text.x = element_text(size = 5,angle = 30,hjust = 0.5, vjust = 0.5))
+```
+
+In random forest model, the most important four variables are *age*、*avg_glucose_level*、*bmi* and *hypertension1*.
+
+```{r}
+confusionMatrix(data = predict(rf_model,test),reference = test$stroke)
+```
+
+The accuracy of the best model on the test set is 0.7955.
+
+
+### Knn model
+
+Perform KNN model on the training data.
+
+```{r}
+set.seed(123)
+
+#Create control function for training with 10 folds and keep 3 folds for training. search method is grid.
+control <- trainControl(method='repeatedcv', 
+                        number=10, 
+                        repeats=3, 
+                        savePredictions = TRUE,
+                        classProbs = TRUE)
+
+knn_model <- train(stroke ~ .,
+                  data = stroke_train_rose,
+                  method = 'knn',
+                  metric = 'Accuracy',
+                  trControl = control,
+                  tuneLength = 20)
+knn_model
+```
+
+
+* the best tuning parameters
+
+```{r}
+knn_model$bestTune %>% 
+  regulartable()
+```
+
+The choice of k = 41 provides an Accuracy of 0.7702416 which is better than other parameters.
+
+*  the smallest cross-validated misclassification error on the
+training data
+
+```{r}
+knn_model$pred %>% 
+  as_tibble() %>% 
+  dplyr::select(pred,obs,No,Yes,Resample) %>% 
+  nest(-Resample) %>% 
+  mutate(acc = map(data,~accuracy_vec(.x$obs,.x$pred))) %>% 
+  unnest(acc) %>% 
+  dplyr::select(-data) %>% 
+  dplyr::slice_max(acc) %>% 
+  mutate(smallest_cross_validated_misclassification_error = 1-acc) %>% 
+  regulartable()
+```
+
+
+*  the best cross-validated AUC score on the training data
+
+```{r}
+knn_model$pred %>% 
+  as_tibble() %>% 
+  dplyr::select(pred,obs,No,Yes,Resample) %>% 
+  group_by(Resample) %>% 
+  summarise(roc_calc = list(pROC::roc(obs,No))) %>% 
+  mutate(auc = map(roc_calc,.f = function(x) return(as.numeric(auc(x))))) %>% 
+  unnest(auc) %>% 
+  dplyr::select(-roc_calc) %>% 
+  dplyr::slice_max(auc) %>% 
+  mutate(best_cross_validated_AUC_score = auc) %>% 
+  regulartable()
+```
+
+
+* the confusion matrix
+
+The average confusion matrix obtained from the prediction results of 10 fold cross validation is shown below.
+
+```{r}
+confusionMatrix.train(knn_model)
+```
+
+When the model uses the best parameters to predict the training set, and calculates the confusion matrix based on this, the accuracy is significantly improved.
+
+```{r}
+confusionMatrix(data = predict(knn_model,stroke_train_rose),reference = stroke_train_rose$stroke)
+```
+
+
+* the most important four predictors 
+
+```{r}
+caret::varImp(knn_model) %>% 
+  .$importance %>% 
+  rownames_to_column("variables") %>% 
+  dplyr::select(1:2) %>% 
+  setNames(c("variables","importance")) %>% 
+  arrange(desc(importance)) %>% 
+  head(4) %>% 
+  regulartable()
+
+caret::varImp(knn_model) %>% 
+  .$importance %>% 
+  rownames_to_column("variables") %>% 
+  dplyr::select(1:2) %>% 
+  setNames(c("variables","importance")) %>% 
+  arrange(desc(importance)) %>% 
+  rowid_to_column("rowid") %>% 
+  mutate(group = case_when(
+    rowid > 4 ~ "B",
+    TRUE ~ "A"
+  )) %>% 
+  ggplot(aes(x = reorder(variables,importance),importance,fill = group))+
+  geom_col(alpha = 0.7,bins = 30) +
+  scale_y_continuous(name = "importance") + 
+  labs(title = "variable importance plot") +
+  guides(fill = FALSE)+
+  ggsci::scale_fill_lancet()+
+  theme_bw()+
+  coord_flip() +
+  theme(plot.title = element_text(size = 14,hjust = 0.5, face = "bold"),
+        text = element_text(size = 10,hjust = 0.5),
+        axis.title.y = element_text(face = "bold",hjust = 0.5),
+        axis.text.x = element_text(size = 5,angle = 30,hjust = 0.5, vjust = 0.5))
+```
+
+In knn model, the most important four variables are *age*、*ever_married*、*hypertension* and *avg_glucose_level*.
+
+```{r}
+confusionMatrix(data = predict(knn_model,test),reference = test$stroke)
+```
+
+The accuracy of the best model on the test set is 0.7323.
+
+
+### Logistic Regression model
+
+Perform logistic regression on the training data. 
+
+```{r}
+set.seed(4321)
+
+#Create control function for training with 10 folds and keep 3 folds for training. search method is grid.
+control <- trainControl(method='repeatedcv', 
+                        number=10, 
+                        repeats=3, 
+                        savePredictions = TRUE,
+                        classProbs = TRUE)
+
+lr_model <- train(stroke ~ .,
+                  data = stroke_train_rose,
+                  method = 'glm',
+                  metric = 'Accuracy',
+                  trControl = control)
+lr_model
+```
+
+
+*  the smallest cross-validated misclassification error on the
+training data
+
+```{r}
+lr_model$pred %>% 
+  as_tibble() %>% 
+  dplyr::select(pred,obs,No,Yes,Resample) %>% 
+  nest(-Resample) %>% 
+  mutate(acc = map(data,~accuracy_vec(.x$obs,.x$pred))) %>% 
+  unnest(acc) %>% 
+  dplyr::select(-data) %>% 
+  dplyr::slice_max(acc) %>% 
+  mutate(smallest_cross_validated_misclassification_error = 1-acc) %>% 
+  regulartable()
+```
+
+
+*  the best cross-validated AUC score on the training data
+
+```{r}
+lr_model$pred %>% 
+  as_tibble() %>% 
+  dplyr::select(pred,obs,No,Yes,Resample) %>% 
+  group_by(Resample) %>% 
+  summarise(roc_calc = list(pROC::roc(obs,No))) %>% 
+  mutate(auc = map(roc_calc,.f = function(x) return(as.numeric(auc(x))))) %>% 
+  unnest(auc) %>% 
+  dplyr::select(-roc_calc) %>% 
+  dplyr::slice_max(auc) %>% 
+  mutate(best_cross_validated_AUC_score = auc) %>% 
+  regulartable()
+```
+
+
+* the confusion matrix
+
+The average confusion matrix obtained from the prediction results of 10 fold cross validation is shown below.
+
+```{r}
+confusionMatrix.train(lr_model)
+```
+
+When the model uses the best parameters to predict the training set, and calculates the confusion matrix based on this, the accuracy is significantly improved.
+
+```{r}
+confusionMatrix(data = predict(knn_model,stroke_train_rose),reference = stroke_train_rose$stroke)
+```
+
+
+* the most important four predictors 
+
+```{r}
+caret::varImp(lr_model) %>% 
+  .$importance %>% 
+  rownames_to_column("variables") %>% 
+  dplyr::select(1:2) %>% 
+  setNames(c("variables","importance")) %>% 
+  arrange(desc(importance)) %>% 
+  head(4) %>% 
+  regulartable()
+
+caret::varImp(lr_model) %>% 
+  .$importance %>% 
+  rownames_to_column("variables") %>% 
+  dplyr::select(1:2) %>% 
+  setNames(c("variables","importance")) %>% 
+  arrange(desc(importance)) %>% 
+  rowid_to_column("rowid") %>% 
+  mutate(group = case_when(
+    rowid > 4 ~ "B",
+    TRUE ~ "A"
+  )) %>% 
+  ggplot(aes(x = reorder(variables,importance),importance,fill = group))+
+  geom_col(alpha = 0.7,bins = 30) +
+  scale_y_continuous(name = "importance") + 
+  labs(title = "variable importance plot") +
+  guides(fill = FALSE)+
+  ggsci::scale_fill_lancet()+
+  theme_bw()+
+  coord_flip() +
+  theme(plot.title = element_text(size = 14,hjust = 0.5, face = "bold"),
+        text = element_text(size = 10,hjust = 0.5),
+        axis.title.y = element_text(face = "bold",hjust = 0.5),
+        axis.text.x = element_text(size = 5,angle = 30,hjust = 0.5, vjust = 0.5))
+```
+
+In logistic regression model, the most important four variables are *age*、*hypertension1* 、*heart_disease1* and *avg_glucose_level*.
+
+```{r}
+confusionMatrix(data = predict(lr_model,test),reference = test$stroke)
+```
+
+The accuracy of the best model on the test set is 0.7582.
+
+
+
+### Bagging model
+
+Perform bagging on the training data.
+
+
+```{r}
+set.seed(321)
+
+#Create control function for training with 10 folds and keep 3 folds for training. search method is grid.
+control <- trainControl(method='repeatedcv', 
+                        number=10, 
+                        repeats=3, 
+                        savePredictions = TRUE,
+                        classProbs = TRUE)
+
+bag_model <- train(stroke ~ .,
+                  data = stroke_train_rose,
+                  method = "treebag",
+                  metric = 'Accuracy',
+                  trControl = control,
+                  importance=TRUE)
+bag_model
+```
+
+*  the smallest cross-validated misclassification error on the
+training data
+
+```{r}
+bag_model$pred %>% 
+  as_tibble() %>% 
+  dplyr::select(pred,obs,No,Yes,Resample) %>% 
+  nest(-Resample) %>% 
+  mutate(acc = map(data,~accuracy_vec(.x$obs,.x$pred))) %>% 
+  unnest(acc) %>% 
+  dplyr::select(-data) %>% 
+  dplyr::slice_max(acc) %>% 
+  mutate(smallest_cross_validated_misclassification_error = 1-acc) %>% 
+  regulartable()
+```
+
+
+*  the best cross-validated AUC score on the training data
+
+```{r}
+bag_model$pred %>% 
+  as_tibble() %>% 
+  dplyr::select(pred,obs,No,Yes,Resample) %>% 
+  group_by(Resample) %>% 
+  summarise(roc_calc = list(pROC::roc(obs,No))) %>% 
+  mutate(auc = map(roc_calc,.f = function(x) return(as.numeric(auc(x))))) %>% 
+  unnest(auc) %>% 
+  dplyr::select(-roc_calc) %>% 
+  dplyr::slice_max(auc) %>% 
+  mutate(best_cross_validated_AUC_score = auc) %>% 
+  regulartable()
+```
+
+
+* the confusion matrix
+
+The average confusion matrix obtained from the prediction results of 10 fold cross validation is shown below.
+
+```{r}
+confusionMatrix.train(bag_model)
+```
+
+When the model uses the best parameters to predict the training set, and calculates the confusion matrix based on this, the accuracy is significantly improved.
+
+```{r}
+confusionMatrix(data = predict(bag_model,stroke_train_rose),reference = stroke_train_rose$stroke)
+```
+
+
+* the most important four predictors 
+
+```{r}
+caret::varImp(bag_model) %>% 
+  .$importance %>% 
+  rownames_to_column("variables") %>% 
+  dplyr::select(1:2) %>% 
+  setNames(c("variables","importance")) %>% 
+  arrange(desc(importance)) %>% 
+  head(4) %>% 
+  regulartable()
+
+caret::varImp(bag_model) %>% 
+  .$importance %>% 
+  rownames_to_column("variables") %>% 
+  dplyr::select(1:2) %>% 
+  setNames(c("variables","importance")) %>% 
+  arrange(desc(importance)) %>% 
+  rowid_to_column("rowid") %>% 
+  mutate(group = case_when(
+    rowid > 4 ~ "B",
+    TRUE ~ "A"
+  )) %>% 
+  ggplot(aes(x = reorder(variables,importance),importance,fill = group))+
+  geom_col(alpha = 0.7,bins = 30) +
+  scale_y_continuous(name = "importance") + 
+  labs(title = "variable importance plot") +
+  guides(fill = FALSE)+
+  ggsci::scale_fill_lancet()+
+  theme_bw()+
+  coord_flip() +
+  theme(plot.title = element_text(size = 14,hjust = 0.5, face = "bold"),
+        text = element_text(size = 10,hjust = 0.5),
+        axis.title.y = element_text(face = "bold",hjust = 0.5),
+        axis.text.x = element_text(size = 5,angle = 30,hjust = 0.5, vjust = 0.5))
+```
+
+In bagging model, the most important four variables are *age*、*avg_glucose_level* 、*bmi* and *hypertension1*.
+
+```{r}
+confusionMatrix(data = predict(bag_model,test),reference = test$stroke)
+```
+
+The accuracy of the best model on the test set is 0.7507.
+
+### Boost model
+
+
+
+
+### ANN model
+
+
+
+Perform ANN on the training data. 
+
+```{r}
+set.seed(999)
+
+#Create control function for training with 10 folds and keep 3 folds for training. search method is grid.
+control <- trainControl(method='repeatedcv', 
+                        number=10, 
+                        repeats=3, 
+                        search='grid',
+                        savePredictions = TRUE,
+                        classProbs = TRUE,
+                        verboseIter = TRUE)
+tuning_grid <- expand.grid(size = c(5, 10, 15),
+                           decay = c(0.1, 0.01, 0.001))
+ann_model <- train(stroke ~ ., data = stroke_train_rose, 
+                method = 'nnet', 
+                preProcess = c('center', 'scale'), 
+                trControl = control, 
+                tuneGrid=tuning_grid,
+                maxit = 1000,
+                earlyStopping = TRUE)
+ann_model
+```
+
+```{r}
+best_params <- ann_model$bestTune
+best_params
+```
+
+
+*  the smallest cross-validated misclassification error on the
+training data
+
+```{r}
+ann_model$pred %>% 
+  as_tibble() %>% 
+  dplyr::select(pred,obs,No,Yes,Resample) %>% 
+  nest(-Resample) %>% 
+  mutate(acc = map(data,~accuracy_vec(.x$obs,.x$pred))) %>% 
+  unnest(acc) %>% 
+  dplyr::select(-data) %>% 
+  dplyr::slice_max(acc) %>% 
+  mutate(smallest_cross_validated_misclassification_error = 1-acc) %>% 
+  regulartable()
+```
+
+
+*  the best cross-validated AUC score on the training data
+
+```{r}
+ann_model$pred %>% 
+  as_tibble() %>% 
+  dplyr::select(pred,obs,No,Yes,Resample) %>% 
+  group_by(Resample) %>% 
+  summarise(roc_calc = list(pROC::roc(obs,No))) %>% 
+  mutate(auc = map(roc_calc,.f = function(x) return(as.numeric(auc(x))))) %>% 
+  unnest(auc) %>% 
+  dplyr::select(-roc_calc) %>% 
+  dplyr::slice_max(auc) %>% 
+  mutate(best_cross_validated_AUC_score = auc) %>% 
+  regulartable()
+```
+
+
+* the confusion matrix
+
+The average confusion matrix obtained from the prediction results of 10 fold cross validation is shown below.
+
+```{r}
+confusionMatrix.train(ann_model)
+```
+
+When the model uses the best parameters to predict the training set, and calculates the confusion matrix based on this, the accuracy is significantly improved.
+
+```{r}
+confusionMatrix(data = predict(bag_model,stroke_train_rose),reference = stroke_train_rose$stroke)
+```
+
+
+* the most important four predictors 
+
+```{r}
+caret::varImp(ann_model) %>% 
+  .$importance %>% 
+  rownames_to_column("variables") %>% 
+  dplyr::select(1:2) %>% 
+  setNames(c("variables","importance")) %>% 
+  arrange(desc(importance)) %>% 
+  head(4) %>% 
+  regulartable()
+
+caret::varImp(ann_model) %>% 
+  .$importance %>% 
+  rownames_to_column("variables") %>% 
+  dplyr::select(1:2) %>% 
+  setNames(c("variables","importance")) %>% 
+  arrange(desc(importance)) %>% 
+  rowid_to_column("rowid") %>% 
+  mutate(group = case_when(
+    rowid > 4 ~ "B",
+    TRUE ~ "A"
+  )) %>% 
+  ggplot(aes(x = reorder(variables,importance),importance,fill = group))+
+  geom_col(alpha = 0.7,bins = 30) +
+  scale_y_continuous(name = "importance") + 
+  labs(title = "variable importance plot") +
+  guides(fill = FALSE)+
+  ggsci::scale_fill_lancet()+
+  theme_bw()+
+  coord_flip() +
+  theme(plot.title = element_text(size = 14,hjust = 0.5, face = "bold"),
+        text = element_text(size = 10,hjust = 0.5),
+        axis.title.y = element_text(face = "bold",hjust = 0.5),
+        axis.text.x = element_text(size = 5,angle = 30,hjust = 0.5, vjust = 0.5))
+```
+
+In ANN model, the most important four variables are *hypertension1*、*Residence_typeUrban* 、*work_typeSelf-employed* and *ever_marriedYes*.
+
+```{r}
+confusionMatrix(data = predict(ann_model,test),reference = test$stroke)
+```
+
+The accuracy of the best model on the test set is 0.7785.
+
